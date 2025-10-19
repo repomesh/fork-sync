@@ -146,13 +146,25 @@ jobs:
               const perPage = 100;
               
               while (true) {
-                const repos = await makeGitHubRequest(`/orgs/${org}/repos?per_page=${perPage}&page=${page}&type=forks`);
+                console.log(`DEBUG: Fetching page ${page} of repositories...`);
+                // Note: GitHub API should include parent by default for forks, but let's be explicit
+                const repos = await makeGitHubRequest(`/orgs/${org}/repos?per_page=${perPage}&page=${page}`);
+                
+                console.log(`DEBUG: Received ${repos ? repos.length : 0} repos from API`);
                 
                 if (!repos || repos.length === 0) {
                   break;
                 }
                 
+                // Debug: Check first repo structure
+                if (repos.length > 0 && page === 1) {
+                  console.log(`DEBUG: Sample repo structure (first repo):`, JSON.stringify(repos[0], null, 2));
+                  console.log(`DEBUG: First repo has .parent:`, !!repos[0].parent);
+                  console.log(`DEBUG: First repo .fork value:`, repos[0].fork);
+                }
+                
                 // Filter for forked repositories and add parent info
+                console.log(`DEBUG: Filtering ${repos.length} repos for forks...`);
                 const forkedRepos = repos.filter(repo => repo.fork).map(repo => {
                   console.log(`DEBUG: Processing repo ${repo.full_name}`);
                   console.log(`DEBUG: repo.parent exists:`, !!repo.parent);
@@ -160,6 +172,8 @@ jobs:
                     console.log(`DEBUG: repo.parent.html_url:`, repo.parent.html_url);
                     console.log(`DEBUG: repo.parent.full_name:`, repo.parent.full_name);
                     console.log(`DEBUG: Full parent object:`, JSON.stringify(repo.parent, null, 2));
+                  } else {
+                    console.log(`DEBUG: NO PARENT DATA for ${repo.full_name}!`);
                   }
                   
                   const repoData = {
