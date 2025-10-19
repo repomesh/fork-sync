@@ -9,9 +9,10 @@ jobs:
   sync-forks:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Changed from read to write
+      contents: write
       issues: write
-      pull-requests: write  # Added for potential PR operations
+      pull-requests: write
+      actions: read
     
     
     outputs:
@@ -37,15 +38,30 @@ jobs:
           echo "Token starts with: ${GITHUB_TOKEN:0:10}..."
           
           # Check what permissions we have
+          echo "=== User Info ==="
           curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
                -H "Accept: application/vnd.github.v3+json" \
                https://api.github.com/user | jq -r '.login, .type'
           
           # Check organization membership
+          echo "=== Organization Membership ==="
           curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
                -H "Accept: application/vnd.github.v3+json" \
                "https://api.github.com/orgs/${{ github.repository_owner }}/members/${{ github.actor }}" \
                -w "HTTP Status: %{http_code}\n"
+          
+          # Check token scopes (this will help identify the issue)
+          echo "=== Token Scopes ==="
+          curl -s -I -H "Authorization: Bearer $GITHUB_TOKEN" \
+               -H "Accept: application/vnd.github.v3+json" \
+               https://api.github.com/user | grep -i "x-oauth-scopes" || echo "No scopes header found"
+          
+          # Test access to a specific repo
+          echo "=== Testing repo access ==="
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+               -H "Accept: application/vnd.github.v3+json" \
+               "https://api.github.com/repos/${{ github.repository_owner }}/tiptap" \
+               -w "HTTP Status: %{http_code}\n" | tail -1
       
       - name: Sync forked repositories
         id: sync
@@ -173,7 +189,13 @@ jobs:
               
               return { success: true, message: 'Success' };
             } catch (error) {
-              console.log(`DEBUG: Sync error for ${repoFullName}:`, error.message);
+              console.log(`DEBUG: REST API sync error for ${repoFullName}:`, error.message);
+              
+              // If REST API fails with permission error, try GitHub CLI as fallback
+              if (error.message.includes('403') || error.message.includes('Resource not accessible')) {
+                console.log(`DEBUG: Trying GitHub CLI fallback for ${repoFullName}`);
+                return await syncRepoWithCLI(repoFullName, branch);
+              }
               
               let message = error.message;
               
@@ -187,6 +209,42 @@ jobs:
                 message = 'Forbidden - insufficient permissions';
               } else if (message.includes('404')) {
                 message = 'Repository not found or not a fork';
+              }
+              
+              return { success: false, message };
+            }
+          }
+          
+          async function syncRepoWithCLI(repoFullName, branch) {
+            const { exec } = require('child_process');
+            const { promisify } = require('util');
+            const execAsync = promisify(exec);
+            
+            try {
+              console.log(`DEBUG: Using GitHub CLI to sync ${repoFullName} branch ${branch}`);
+              
+              const command = `gh repo sync ${repoFullName} -b ${branch} --force`;
+              console.log(`DEBUG: Running command: ${command}`);
+              
+              const { stdout, stderr } = await execAsync(command, {
+                timeout: 300000, // 5 minutes
+                env: { ...process.env, GITHUB_TOKEN: process.env.GITHUB_TOKEN }
+              });
+              
+              console.log(`DEBUG: CLI stdout:`, stdout);
+              if (stderr) console.log(`DEBUG: CLI stderr:`, stderr);
+              
+              return { success: true, message: 'Success (via CLI)' };
+            } catch (cliError) {
+              console.log(`DEBUG: CLI sync error for ${repoFullName}:`, cliError.message);
+              
+              let message = 'CLI sync failed';
+              if (cliError.message.includes('already up to date')) {
+                return { success: true, message: 'Already up to date (via CLI)' };
+              } else if (cliError.message.includes('permission')) {
+                message = 'Permission denied (CLI)';
+              } else if (cliError.message.includes('not found')) {
+                message = 'Repository not found (CLI)';
               }
               
               return { success: false, message };
