@@ -159,19 +159,18 @@ jobs:
                 branch: branch
               });
               
-              return { success: true, message: 'Success' };
-            } catch (error) {
-              // If REST API fails with permission error, try GitHub CLI as fallback
-              if (error.message.includes('403') || error.message.includes('Resource not accessible')) {
-                return await syncRepoWithCLI(repoFullName, branch);
-              }
+              // Extract base_branch (e.g., "ueberdosis:develop") and convert to URL
+              const baseBranch = response.base_branch;
+              const sourceUrl = baseBranch ? `https://github.com/${baseBranch.replace(':', '/tree/')}` : null;
               
+              return { success: true, message: 'Success', sourceUrl };
+            } catch (error) {
               let message = error.message;
               
               // Handle specific GitHub API error messages
               if (message.includes('409')) {
                 message = 'Already up to date';
-                return { success: true, message }; // Treat as success
+                return { success: true, message, sourceUrl: null }; // Treat as success
               } else if (message.includes('422')) {
                 message = 'Cannot sync - may have conflicts or custom commits';
               } else if (message.includes('403')) {
@@ -180,37 +179,7 @@ jobs:
                 message = 'Repository not found or not a fork';
               }
               
-              return { success: false, message };
-            }
-          }
-          
-          async function syncRepoWithCLI(repoFullName, branch) {
-            const { exec } = require('child_process');
-            const { promisify } = require('util');
-            const execAsync = promisify(exec);
-            
-            try {
-              const { stdout, stderr } = await execAsync(
-                `gh repo sync ${repoFullName} -b ${branch} --force`,
-                {
-                  timeout: 300000,
-                  env: { ...process.env, GITHUB_TOKEN: process.env.GITHUB_TOKEN }
-                }
-              );
-              
-              return { success: true, message: 'Success (via CLI)' };
-            } catch (cliError) {
-              
-              let message = 'CLI sync failed';
-              if (cliError.message.includes('already up to date')) {
-                return { success: true, message: 'Already up to date (via CLI)' };
-              } else if (cliError.message.includes('permission')) {
-                message = 'Permission denied (CLI)';
-              } else if (cliError.message.includes('not found')) {
-                message = 'Repository not found (CLI)';
-              }
-              
-              return { success: false, message };
+              return { success: false, message, sourceUrl: null };
             }
           }
           
@@ -233,12 +202,12 @@ jobs:
             
             for (const repo of forkedRepos) {
               const repoName = repo.nameWithOwner;
-              const sourceUrl = repo.sourceUrl;
+              const fallbackSourceUrl = repo.sourceUrl;
               const defaultBranch = repo.defaultBranch;
               
               console.log(`Syncing ${repoName} (${defaultBranch})...`);
               
-              const { success, message } = await syncRepo(repoName, defaultBranch);
+              const { success, message, sourceUrl: syncSourceUrl } = await syncRepo(repoName, defaultBranch);
               const status = success ? '✓' : '✗';
               
               console.log(`${status} ${repoName}${message !== 'Success' ? ` (${message})` : ''}`);
@@ -249,11 +218,14 @@ jobs:
                 failedCount++;
               }
               
+              // Use sourceUrl from sync response if available, otherwise use fallback
+              const finalSourceUrl = syncSourceUrl || fallbackSourceUrl;
+              
               results.push({
                 repo: repoName,
                 status: success ? 'success' : 'failed',
                 message: message,
-                parent: sourceUrl,
+                parent: finalSourceUrl,
                 branch: defaultBranch
               });
             }
