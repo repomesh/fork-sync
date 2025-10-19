@@ -160,8 +160,9 @@ jobs:
               });
               
               // Extract base_branch (e.g., "ueberdosis:develop") and convert to URL
+              // Include the current repo name to construct full upstream URL
               const baseBranch = response.base_branch;
-              const sourceUrl = baseBranch ? `https://github.com/${baseBranch.replace(':', '/tree/')}` : null;
+              const sourceUrl = baseBranch ? `https://github.com/${baseBranch.replace(':', `/${repo}/tree/`)}` : null;
               
               return { success: true, message: 'Success', sourceUrl };
             } catch (error) {
