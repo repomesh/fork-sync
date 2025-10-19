@@ -79,6 +79,15 @@ jobs:
               const req = https.request(options, (res) => {
                 let responseData = '';
                 
+                // Extract rate limit information from headers
+                const rateLimitRemaining = res.headers['x-ratelimit-remaining'];
+                const rateLimitReset = res.headers['x-ratelimit-reset'];
+                const rateLimitLimit = res.headers['x-ratelimit-limit'];
+                
+                if (rateLimitRemaining !== undefined) {
+                  console.log(`Rate Limit: ${rateLimitRemaining}/${rateLimitLimit} remaining (resets at ${new Date(rateLimitReset * 1000).toISOString()})`);
+                }
+                
                 res.on('data', (chunk) => {
                   responseData += chunk;
                 });
@@ -88,6 +97,10 @@ jobs:
                     const parsed = responseData ? JSON.parse(responseData) : {};
                     if (res.statusCode >= 200 && res.statusCode < 300) {
                       resolve(parsed);
+                    } else if (res.statusCode === 429) {
+                      // Rate limited - include retry-after information
+                      const retryAfter = res.headers['retry-after'] || 60;
+                      reject(new Error(`HTTP 429: Rate limited. Retry after ${retryAfter} seconds. ${parsed.message || responseData}`));
                     } else {
                       reject(new Error(`HTTP ${res.statusCode}: ${parsed.message || responseData}`));
                     }
@@ -182,13 +195,18 @@ jobs:
             }
           }
           
+          // Utility function to add delay (in milliseconds)
+          function delay(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+          }
+          
           // Main logic
 
           async function main() {
             console.log('Fetching repositories...');
             const forkedRepos = await getAllRepos(org);
             
-            console.log(`Found ${forkedRepos.length} forked repositories for testing\n`);
+            console.log(`Found ${forkedRepos.length} forked repositories\n`);
             
             if (forkedRepos.length === 0) {
               console.log('No forked repositories found');
@@ -199,12 +217,19 @@ jobs:
             let successCount = 0;
             let failedCount = 0;
             
-            for (const repo of forkedRepos) {
+            for (let i = 0; i < forkedRepos.length; i++) {
+              const repo = forkedRepos[i];
               const repoName = repo.nameWithOwner;
               const fallbackSourceUrl = repo.sourceUrl;
               const defaultBranch = repo.defaultBranch;
               
-              console.log(`Syncing ${repoName} (${defaultBranch})...`);
+              // Add delay between requests to respect rate limits (roughly 1 repo per 2 seconds)
+              // This gives us ~1800 repos per hour, well under the 5000 request limit
+              if (i > 0) {
+                await delay(2000);
+              }
+              
+              console.log(`[${i + 1}/${forkedRepos.length}] Syncing ${repoName} (${defaultBranch})...`);
               
               const { success, message, sourceUrl: syncSourceUrl } = await syncRepo(repoName, defaultBranch);
               const status = success ? '✓' : '✗';
