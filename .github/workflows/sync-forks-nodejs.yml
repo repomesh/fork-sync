@@ -9,8 +9,10 @@ jobs:
   sync-forks:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write  # Changed from read to write
       issues: write
+      pull-requests: write  # Added for potential PR operations
+    
     
     outputs:
       sync-summary: ${{ steps.sync.outputs.summary }}
@@ -25,6 +27,25 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: '18'
+      
+      - name: Debug token permissions
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "DEBUG: Checking token permissions..."
+          echo "Token length: ${#GITHUB_TOKEN}"
+          echo "Token starts with: ${GITHUB_TOKEN:0:10}..."
+          
+          # Check what permissions we have
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+               -H "Accept: application/vnd.github.v3+json" \
+               https://api.github.com/user | jq -r '.login, .type'
+          
+          # Check organization membership
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+               -H "Accept: application/vnd.github.v3+json" \
+               "https://api.github.com/orgs/${{ github.repository_owner }}/members/${{ github.actor }}" \
+               -w "HTTP Status: %{http_code}\n"
       
       - name: Sync forked repositories
         id: sync
@@ -123,7 +144,10 @@ jobs:
                 page++;
               }
               
-              return allRepos;
+              // FOR DEBUGGING: Return only the first repository
+              console.log(`DEBUG: Found ${allRepos.length} total forked repos, testing with first one only`);
+              return allRepos.slice(0, 1);
+              
             } catch (error) {
               console.error('Error fetching repositories:', error.message);
               return [];
@@ -136,12 +160,19 @@ jobs:
               // POST /repos/{owner}/{repo}/merge-upstream
               const [owner, repo] = repoFullName.split('/');
               
-              await makeGitHubRequest(`/repos/${owner}/${repo}/merge-upstream`, 'POST', {
+              console.log(`DEBUG: Attempting to sync ${repoFullName} with branch ${branch}`);
+              console.log(`DEBUG: Making POST request to /repos/${owner}/${repo}/merge-upstream`);
+              
+              const response = await makeGitHubRequest(`/repos/${owner}/${repo}/merge-upstream`, 'POST', {
                 branch: branch
               });
               
+              console.log(`DEBUG: Sync response:`, JSON.stringify(response, null, 2));
+              
               return { success: true, message: 'Success' };
             } catch (error) {
+              console.log(`DEBUG: Sync error for ${repoFullName}:`, error.message);
+              
               let message = error.message;
               
               // Handle specific GitHub API error messages
@@ -162,10 +193,25 @@ jobs:
           
           // Main logic
           async function main() {
+            console.log('DEBUG: Starting fork sync process...');
+            console.log(`DEBUG: Organization: ${org}`);
+            console.log(`DEBUG: Token length: ${token ? token.length : 'undefined'}`);
+            console.log(`DEBUG: Token starts with: ${token ? token.substring(0, 10) + '...' : 'undefined'}`);
+            
             console.log('Fetching repositories...');
             const forkedRepos = await getAllRepos(org);
             
-            console.log(`Found ${forkedRepos.length} forked repositories\n`);
+            console.log(`Found ${forkedRepos.length} forked repositories for testing\n`);
+            
+            if (forkedRepos.length === 0) {
+              console.log('No forked repositories found to test');
+              return;
+            }
+            
+            // Print repo details for debugging
+            forkedRepos.forEach(repo => {
+              console.log(`DEBUG: Repo to test: ${repo.nameWithOwner} (parent: ${repo.parent?.full_name || 'Unknown'})`);
+            });
             
             const results = [];
             let successCount = 0;
