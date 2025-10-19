@@ -129,9 +129,11 @@ jobs:
                   name: repo.name,
                   nameWithOwner: repo.full_name,
                   isFork: repo.fork,
+                  defaultBranch: repo.default_branch || 'main',
                   parent: repo.parent ? {
                     url: repo.parent.html_url,
-                    full_name: repo.parent.full_name
+                    full_name: repo.parent.full_name,
+                    default_branch: repo.parent.default_branch || 'main'
                   } : null
                 }));
                 
@@ -192,6 +194,7 @@ jobs:
           }
           
           // Main logic
+
           async function main() {
             console.log('DEBUG: Starting fork sync process...');
             console.log(`DEBUG: Organization: ${org}`);
@@ -220,10 +223,11 @@ jobs:
             for (const repo of forkedRepos) {
               const repoName = repo.nameWithOwner;
               const parentUrl = repo.parent?.url || 'Unknown';
+              const defaultBranch = repo.defaultBranch;
               
-              console.log(`Syncing ${repoName}...`);
+              console.log(`Syncing ${repoName} (default branch: ${defaultBranch})...`);
               
-              const { success, message } = await syncRepo(repoName);
+              const { success, message } = await syncRepo(repoName, defaultBranch);
               const status = success ? '✓' : '✗';
               
               console.log(`${status} ${repoName}${message !== 'Success' ? ` (${message})` : ''}`);
@@ -238,7 +242,8 @@ jobs:
                 repo: repoName,
                 status: success ? 'success' : 'failed',
                 message: message,
-                parent: parentUrl
+                parent: parentUrl,
+                branch: defaultBranch
               });
             }
             
@@ -324,7 +329,7 @@ jobs:
               if (successful.length > 0) {
                 body += `### ✅ Successful (${successful.length})\n`;
                 successful.forEach(r => {
-                  body += `- **${r.repo}** → ${r.parent}\n`;
+                  body += `- **${r.repo}** (\`${r.branch}\`) → ${r.parent}\n`;
                 });
                 body += '\n';
               }
@@ -332,7 +337,7 @@ jobs:
               if (failed_repos.length > 0) {
                 body += `### ❌ Failed (${failed_repos.length})\n`;
                 failed_repos.forEach(r => {
-                  body += `- **${r.repo}** (${r.message})\n`;
+                  body += `- **${r.repo}** (\`${r.branch}\`) - ${r.message}\n`;
                 });
               }
             }
