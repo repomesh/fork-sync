@@ -153,18 +153,33 @@ jobs:
                 }
                 
                 // Filter for forked repositories and add parent info
-                const forkedRepos = repos.filter(repo => repo.fork).map(repo => ({
-                  name: repo.name,
-                  nameWithOwner: repo.full_name,
-                  isFork: repo.fork,
-                  defaultBranch: repo.default_branch || 'main',
-                  parentUrl: repo.parent ? repo.parent.html_url : 'Unknown',
-                  parent: repo.parent ? {
-                    url: repo.parent.html_url,
-                    full_name: repo.parent.full_name,
-                    default_branch: repo.parent.default_branch || 'main'
-                  } : null
-                }));
+                const forkedRepos = repos.filter(repo => repo.fork).map(repo => {
+                  console.log(`DEBUG: Processing repo ${repo.full_name}`);
+                  console.log(`DEBUG: repo.parent exists:`, !!repo.parent);
+                  if (repo.parent) {
+                    console.log(`DEBUG: repo.parent.html_url:`, repo.parent.html_url);
+                    console.log(`DEBUG: repo.parent.full_name:`, repo.parent.full_name);
+                    console.log(`DEBUG: Full parent object:`, JSON.stringify(repo.parent, null, 2));
+                  }
+                  
+                  const repoData = {
+                    name: repo.name,
+                    nameWithOwner: repo.full_name,
+                    isFork: repo.fork,
+                    defaultBranch: repo.default_branch || 'main',
+                    parentUrl: repo.parent ? repo.parent.html_url : 'Unknown',
+                    parent: repo.parent ? {
+                      url: repo.parent.html_url,
+                      full_name: repo.parent.full_name,
+                      default_branch: repo.parent.default_branch || 'main'
+                    } : null
+                  };
+                  
+                  console.log(`DEBUG: Created parentUrl:`, repoData.parentUrl);
+                  console.log(`DEBUG: Created parent object:`, JSON.stringify(repoData.parent, null, 2));
+                  
+                  return repoData;
+                });
                 
                 allRepos = allRepos.concat(forkedRepos);
                 
@@ -285,6 +300,8 @@ jobs:
             // Print repo details for debugging
             forkedRepos.forEach(repo => {
               console.log(`DEBUG: Repo to test: ${repo.nameWithOwner} (parent: ${repo.parent?.full_name || 'Unknown'})`);
+              console.log(`DEBUG: Parent URL for ${repo.nameWithOwner}: ${repo.parentUrl}`);
+              console.log(`DEBUG: Full repo object:`, JSON.stringify(repo, null, 2));
             });
             
             const results = [];
@@ -295,6 +312,10 @@ jobs:
               const repoName = repo.nameWithOwner;
               const parentUrl = repo.parentUrl;
               const defaultBranch = repo.defaultBranch;
+              
+              console.log(`\nDEBUG: About to sync ${repoName}`);
+              console.log(`DEBUG: parentUrl value: "${parentUrl}"`);
+              console.log(`DEBUG: defaultBranch: "${defaultBranch}"`);
               
               console.log(`Syncing ${repoName} (default branch: ${defaultBranch})...`);
               
@@ -316,11 +337,16 @@ jobs:
                 parent: parentUrl,
                 branch: defaultBranch
               });
+              
+              console.log(`DEBUG: Pushed result with parent: "${parentUrl}"`);
             }
             
             // Output for GitHub Actions
             const summary = JSON.stringify(results);
             const outputFile = process.env.GITHUB_OUTPUT;
+            
+            console.log(`\nDEBUG: Final results array:`, JSON.stringify(results, null, 2));
+            console.log(`DEBUG: Summary being written:`, summary);
             
             fs.appendFileSync(outputFile, `summary=${summary}\n`);
             fs.appendFileSync(outputFile, `total=${forkedRepos.length}\n`);
@@ -420,20 +446,21 @@ jobs:
             const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              state: 'all',
+              state: 'open',
               labels: 'fork-sync-status'
             });
             
             const existingIssue = issues.data.find(i => 
-              i.title.includes('Fork Sync Status') && i.state === 'open'
+              i.title.includes('Fork Sync Status')
             );
             
             if (existingIssue) {
-              // Update existing issue
+              // Update existing issue with new data
               await github.rest.issues.update({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: existingIssue.number,
+                title: `Fork Sync Status - ${new Date().toISOString().split('T')[0]}`,
                 body: body
               });
               console.log(`Updated issue #${existingIssue.number}`);
