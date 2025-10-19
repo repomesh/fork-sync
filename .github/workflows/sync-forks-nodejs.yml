@@ -158,6 +158,7 @@ jobs:
                   nameWithOwner: repo.full_name,
                   isFork: repo.fork,
                   defaultBranch: repo.default_branch || 'main',
+                  parentUrl: repo.parent ? repo.parent.html_url : 'Unknown',
                   parent: repo.parent ? {
                     url: repo.parent.html_url,
                     full_name: repo.parent.full_name,
@@ -292,7 +293,7 @@ jobs:
             
             for (const repo of forkedRepos) {
               const repoName = repo.nameWithOwner;
-              const parentUrl = repo.parent?.url || 'Unknown';
+              const parentUrl = repo.parentUrl;
               const defaultBranch = repo.defaultBranch;
               
               console.log(`Syncing ${repoName} (default branch: ${defaultBranch})...`);
