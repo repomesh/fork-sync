@@ -29,51 +29,19 @@ jobs:
         with:
           node-version: '18'
       
-      - name: Debug token permissions
+      - name: Check token type
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          echo "DEBUG: Checking token permissions..."
-          echo "Token length: ${#GITHUB_TOKEN}"
-          echo "Token starts with: ${GITHUB_TOKEN:0:10}..."
-          
-          # Check token type
           if [[ "$GITHUB_TOKEN" == ghp_* ]]; then
             echo "✅ Using Personal Access Token (Classic)"
           elif [[ "$GITHUB_TOKEN" == github_pat_* ]]; then
             echo "✅ Using Fine-Grained Personal Access Token"
           elif [[ "$GITHUB_TOKEN" == ghs_* ]]; then
             echo "⚠️  WARNING: Using default GITHUB_TOKEN (has limited permissions)"
-            echo "⚠️  This will likely FAIL to sync forks!"
             echo "⚠️  Please create a Personal Access Token and add it as 'PAT_TOKEN' secret"
             echo "⚠️  See SETUP.md for instructions"
           fi
-          
-          # Check what permissions we have
-          echo "=== User Info ==="
-          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
-               -H "Accept: application/vnd.github.v3+json" \
-               https://api.github.com/user | jq -r '.login, .type'
-          
-          # Check organization membership
-          echo "=== Organization Membership ==="
-          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
-               -H "Accept: application/vnd.github.v3+json" \
-               "https://api.github.com/orgs/${{ github.repository_owner }}/members/${{ github.actor }}" \
-               -w "HTTP Status: %{http_code}\n"
-          
-          # Check token scopes (this will help identify the issue)
-          echo "=== Token Scopes ==="
-          curl -s -I -H "Authorization: Bearer $GITHUB_TOKEN" \
-               -H "Accept: application/vnd.github.v3+json" \
-               https://api.github.com/user | grep -i "x-oauth-scopes" || echo "No scopes header found (may be GitHub Actions token)"
-          
-          # Test access to a specific repo
-          echo "=== Testing repo access ==="
-          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
-               -H "Accept: application/vnd.github.v3+json" \
-               "https://api.github.com/repos/${{ github.repository_owner }}/tiptap" \
-               -w "HTTP Status: %{http_code}\n" | tail -1
       
       - name: Sync forked repositories
         id: sync
@@ -146,54 +114,21 @@ jobs:
               const perPage = 100;
               
               while (true) {
-                console.log(`DEBUG: Fetching page ${page} of repositories...`);
-                // Note: GitHub API should include parent by default for forks, but let's be explicit
                 const repos = await makeGitHubRequest(`/orgs/${org}/repos?per_page=${perPage}&page=${page}`);
-                
-                console.log(`DEBUG: Received ${repos ? repos.length : 0} repos from API`);
                 
                 if (!repos || repos.length === 0) {
                   break;
                 }
                 
-                // Debug: Check first repo structure
-                if (repos.length > 0 && page === 1) {
-                  console.log(`DEBUG: Sample repo structure (first repo):`, JSON.stringify(repos[0], null, 2));
-                  console.log(`DEBUG: First repo has .parent:`, !!repos[0].parent);
-                  console.log(`DEBUG: First repo .fork value:`, repos[0].fork);
-                }
-                
-                // Filter for forked repositories and add parent info
-                console.log(`DEBUG: Filtering ${repos.length} repos for forks...`);
-                const forkedRepos = repos.filter(repo => repo.fork).map(repo => {
-                  console.log(`DEBUG: Processing repo ${repo.full_name}`);
-                  console.log(`DEBUG: repo.parent exists:`, !!repo.parent);
-                  if (repo.parent) {
-                    console.log(`DEBUG: repo.parent.html_url:`, repo.parent.html_url);
-                    console.log(`DEBUG: repo.parent.full_name:`, repo.parent.full_name);
-                    console.log(`DEBUG: Full parent object:`, JSON.stringify(repo.parent, null, 2));
-                  } else {
-                    console.log(`DEBUG: NO PARENT DATA for ${repo.full_name}!`);
-                  }
-                  
-                  const repoData = {
-                    name: repo.name,
-                    nameWithOwner: repo.full_name,
-                    isFork: repo.fork,
-                    defaultBranch: repo.default_branch || 'main',
-                    parentUrl: repo.parent ? repo.parent.html_url : 'Unknown',
-                    parent: repo.parent ? {
-                      url: repo.parent.html_url,
-                      full_name: repo.parent.full_name,
-                      default_branch: repo.parent.default_branch || 'main'
-                    } : null
-                  };
-                  
-                  console.log(`DEBUG: Created parentUrl:`, repoData.parentUrl);
-                  console.log(`DEBUG: Created parent object:`, JSON.stringify(repoData.parent, null, 2));
-                  
-                  return repoData;
-                });
+                // Filter for forked repositories
+                const forkedRepos = repos.filter(repo => repo.fork).map(repo => ({
+                  name: repo.name,
+                  nameWithOwner: repo.full_name,
+                  isFork: repo.fork,
+                  defaultBranch: repo.default_branch || 'main',
+                  sourceUrl: repo.parent?.html_url || repo.source?.html_url || `https://github.com/${repo.full_name}`,
+                  description: repo.description || ''
+                }));
                 
                 allRepos = allRepos.concat(forkedRepos);
                 
@@ -220,22 +155,14 @@ jobs:
               // POST /repos/{owner}/{repo}/merge-upstream
               const [owner, repo] = repoFullName.split('/');
               
-              console.log(`DEBUG: Attempting to sync ${repoFullName} with branch ${branch}`);
-              console.log(`DEBUG: Making POST request to /repos/${owner}/${repo}/merge-upstream`);
-              
               const response = await makeGitHubRequest(`/repos/${owner}/${repo}/merge-upstream`, 'POST', {
                 branch: branch
               });
               
-              console.log(`DEBUG: Sync response:`, JSON.stringify(response, null, 2));
-              
               return { success: true, message: 'Success' };
             } catch (error) {
-              console.log(`DEBUG: REST API sync error for ${repoFullName}:`, error.message);
-              
               // If REST API fails with permission error, try GitHub CLI as fallback
               if (error.message.includes('403') || error.message.includes('Resource not accessible')) {
-                console.log(`DEBUG: Trying GitHub CLI fallback for ${repoFullName}`);
                 return await syncRepoWithCLI(repoFullName, branch);
               }
               
@@ -263,22 +190,16 @@ jobs:
             const execAsync = promisify(exec);
             
             try {
-              console.log(`DEBUG: Using GitHub CLI to sync ${repoFullName} branch ${branch}`);
-              
-              const command = `gh repo sync ${repoFullName} -b ${branch} --force`;
-              console.log(`DEBUG: Running command: ${command}`);
-              
-              const { stdout, stderr } = await execAsync(command, {
-                timeout: 300000, // 5 minutes
-                env: { ...process.env, GITHUB_TOKEN: process.env.GITHUB_TOKEN }
-              });
-              
-              console.log(`DEBUG: CLI stdout:`, stdout);
-              if (stderr) console.log(`DEBUG: CLI stderr:`, stderr);
+              const { stdout, stderr } = await execAsync(
+                `gh repo sync ${repoFullName} -b ${branch} --force`,
+                {
+                  timeout: 300000,
+                  env: { ...process.env, GITHUB_TOKEN: process.env.GITHUB_TOKEN }
+                }
+              );
               
               return { success: true, message: 'Success (via CLI)' };
             } catch (cliError) {
-              console.log(`DEBUG: CLI sync error for ${repoFullName}:`, cliError.message);
               
               let message = 'CLI sync failed';
               if (cliError.message.includes('already up to date')) {
@@ -296,27 +217,15 @@ jobs:
           // Main logic
 
           async function main() {
-            console.log('DEBUG: Starting fork sync process...');
-            console.log(`DEBUG: Organization: ${org}`);
-            console.log(`DEBUG: Token length: ${token ? token.length : 'undefined'}`);
-            console.log(`DEBUG: Token starts with: ${token ? token.substring(0, 10) + '...' : 'undefined'}`);
-            
             console.log('Fetching repositories...');
             const forkedRepos = await getAllRepos(org);
             
             console.log(`Found ${forkedRepos.length} forked repositories for testing\n`);
             
             if (forkedRepos.length === 0) {
-              console.log('No forked repositories found to test');
+              console.log('No forked repositories found');
               return;
             }
-            
-            // Print repo details for debugging
-            forkedRepos.forEach(repo => {
-              console.log(`DEBUG: Repo to test: ${repo.nameWithOwner} (parent: ${repo.parent?.full_name || 'Unknown'})`);
-              console.log(`DEBUG: Parent URL for ${repo.nameWithOwner}: ${repo.parentUrl}`);
-              console.log(`DEBUG: Full repo object:`, JSON.stringify(repo, null, 2));
-            });
             
             const results = [];
             let successCount = 0;
@@ -324,14 +233,10 @@ jobs:
             
             for (const repo of forkedRepos) {
               const repoName = repo.nameWithOwner;
-              const parentUrl = repo.parentUrl;
+              const sourceUrl = repo.sourceUrl;
               const defaultBranch = repo.defaultBranch;
               
-              console.log(`\nDEBUG: About to sync ${repoName}`);
-              console.log(`DEBUG: parentUrl value: "${parentUrl}"`);
-              console.log(`DEBUG: defaultBranch: "${defaultBranch}"`);
-              
-              console.log(`Syncing ${repoName} (default branch: ${defaultBranch})...`);
+              console.log(`Syncing ${repoName} (${defaultBranch})...`);
               
               const { success, message } = await syncRepo(repoName, defaultBranch);
               const status = success ? '✓' : '✗';
@@ -348,19 +253,14 @@ jobs:
                 repo: repoName,
                 status: success ? 'success' : 'failed',
                 message: message,
-                parent: parentUrl,
+                parent: sourceUrl,
                 branch: defaultBranch
               });
-              
-              console.log(`DEBUG: Pushed result with parent: "${parentUrl}"`);
             }
             
             // Output for GitHub Actions
             const summary = JSON.stringify(results);
             const outputFile = process.env.GITHUB_OUTPUT;
-            
-            console.log(`\nDEBUG: Final results array:`, JSON.stringify(results, null, 2));
-            console.log(`DEBUG: Summary being written:`, summary);
             
             fs.appendFileSync(outputFile, `summary=${summary}\n`);
             fs.appendFileSync(outputFile, `total=${forkedRepos.length}\n`);
