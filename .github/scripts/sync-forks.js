@@ -97,6 +97,15 @@ function shouldRetry(error) {
   return error.status === 403 && message.includes('rate limit');
 }
 
+function isRateLimitError(error) {
+  if (!(error instanceof GitHubApiError)) {
+    return false;
+  }
+
+  const message = String(error.response?.message || error.message || '').toLowerCase();
+  return message.includes('rate limit');
+}
+
 async function readResponse(response) {
   const text = await response.text();
   if (!text) {
@@ -358,7 +367,7 @@ function upstreamAwareSkipReason(repo, syncState, now) {
 
 function blockedSyncRetryReason(repo, syncState, now) {
   const entry = repoState(syncState, repo.nameWithOwner);
-  if (forceBlockedSync && !String(entry.lastMessage || '').includes('forced upstream reset failed')) {
+  if (forceBlockedSync && !shouldUseBlockedRetryWindow(entry.lastMessage)) {
     return null;
   }
 
@@ -433,6 +442,24 @@ function apiErrorMessage(error, fallback) {
   }
 
   return fallback;
+}
+
+function forbiddenSyncMessage(error) {
+  const detail = apiErrorMessage(error, 'insufficient permissions');
+  return String(detail).toLowerCase().includes('forbidden') ? detail : `Forbidden - ${detail}`;
+}
+
+function shouldUseBlockedRetryWindow(message) {
+  const normalized = String(message || '').toLowerCase();
+  return [
+    'forced upstream reset failed',
+    'forbidden',
+    'insufficient permission',
+    'resource not accessible',
+    'enterprise forbids access',
+    'personal access token',
+    'saml sso'
+  ].some(fragment => normalized.includes(fragment));
 }
 
 function splitRepoFullName(fullName) {
@@ -549,7 +576,13 @@ async function syncRepo(repoFullName, branch = 'main', upstreamName = '', upstre
         status = 'blocked';
         message = `Blocked - ${apiErrorMessage(error, 'GitHub could not sync this branch for another reason')}`;
       } else if (error.status === 403) {
-        message = 'Forbidden - insufficient permissions or rate limited';
+        const detail = forbiddenSyncMessage(error);
+        if (!isRateLimitError(error)) {
+          status = 'blocked';
+          message = `Blocked - ${detail}`;
+        } else {
+          message = detail;
+        }
       } else if (error.status === 404) {
         message = 'Repository not found or not a fork';
       }
