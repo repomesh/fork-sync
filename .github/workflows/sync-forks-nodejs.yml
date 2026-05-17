@@ -1,387 +1,58 @@
 name: Sync All Forked Repos (Node.js)
 
-on:
+"on":
   schedule:
-    - cron: '0 2 * * 0'  # Weekly on Sunday at 2 AM UTC
+    - cron: '0 2 * * 0'
   workflow_dispatch:
+
+concurrency:
+  group: sync-forks-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   sync-forks:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     permissions:
-      contents: write
+      contents: read
       issues: write
-      pull-requests: write
-      actions: read
-    
-    
-    outputs:
-      sync-summary: ${{ steps.sync.outputs.summary }}
-      total-repos: ${{ steps.sync.outputs.total }}
-      success-count: ${{ steps.sync.outputs.success }}
-      failed-count: ${{ steps.sync.outputs.failed }}
-    
+
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Set up Node.js
-        uses: actions/setup-node@v3
+      - uses: actions/checkout@v6
+
+      - name: Set up default Node.js
+        uses: actions/setup-node@v6
         with:
-          node-version: '18'
-      
-      - name: Check token type
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
-        run: |
-          if [[ "$GITHUB_TOKEN" == ghp_* ]]; then
-            echo "✅ Using Personal Access Token (Classic)"
-          elif [[ "$GITHUB_TOKEN" == github_pat_* ]]; then
-            echo "✅ Using Fine-Grained Personal Access Token"
-          elif [[ "$GITHUB_TOKEN" == ghs_* ]]; then
-            echo "⚠️  WARNING: Using default GITHUB_TOKEN (has limited permissions)"
-            echo "⚠️  Please create a Personal Access Token and add it as 'PAT_TOKEN' secret"
-            echo "⚠️  See SETUP.md for instructions"
-          fi
-      
+          package-manager-cache: false
+
       - name: Sync forked repositories
         id: sync
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.FORK_SYNC_PAT }}
           ORG_NAME: ${{ github.repository_owner }}
-        run: |
-          node - << 'EOF'
-          const https = require('https');
-          const fs = require('fs');
-          
-          const org = process.env.ORG_NAME;
-          const token = process.env.GITHUB_TOKEN;
-          
-          function makeGitHubRequest(path, method = 'GET', data = null) {
-            return new Promise((resolve, reject) => {
-              const options = {
-                hostname: 'api.github.com',
-                path: path,
-                method: method,
-                headers: {
-                  'Authorization': `Bearer ${token}`,
-                  'Accept': 'application/vnd.github.v3+json',
-                  'User-Agent': 'GitHub-Actions-Fork-Sync',
-                  'X-GitHub-Api-Version': '2022-11-28'
-                }
-              };
-              
-              if (data) {
-                const jsonData = JSON.stringify(data);
-                options.headers['Content-Type'] = 'application/json';
-                options.headers['Content-Length'] = Buffer.byteLength(jsonData);
-              }
-              
-              const req = https.request(options, (res) => {
-                let responseData = '';
-                
-                // Extract rate limit information from headers
-                const rateLimitRemaining = res.headers['x-ratelimit-remaining'];
-                const rateLimitReset = res.headers['x-ratelimit-reset'];
-                const rateLimitLimit = res.headers['x-ratelimit-limit'];
-                
-                if (rateLimitRemaining !== undefined) {
-                  console.log(`Rate Limit: ${rateLimitRemaining}/${rateLimitLimit} remaining (resets at ${new Date(rateLimitReset * 1000).toISOString()})`);
-                }
-                
-                res.on('data', (chunk) => {
-                  responseData += chunk;
-                });
-                
-                res.on('end', () => {
-                  try {
-                    const parsed = responseData ? JSON.parse(responseData) : {};
-                    if (res.statusCode >= 200 && res.statusCode < 300) {
-                      resolve(parsed);
-                    } else if (res.statusCode === 429) {
-                      // Rate limited - include retry-after information
-                      const retryAfter = res.headers['retry-after'] || 60;
-                      reject(new Error(`HTTP 429: Rate limited. Retry after ${retryAfter} seconds. ${parsed.message || responseData}`));
-                    } else {
-                      reject(new Error(`HTTP ${res.statusCode}: ${parsed.message || responseData}`));
-                    }
-                  } catch (e) {
-                    reject(new Error(`Failed to parse response: ${responseData}`));
-                  }
-                });
-              });
-              
-              req.on('error', reject);
-              
-              if (data) {
-                req.write(JSON.stringify(data));
-              }
-              
-              req.end();
-            });
-          }
-          
-          async function getAllRepos(org) {
-            try {
-              let allRepos = [];
-              let page = 1;
-              const perPage = 100;
-              
-              while (true) {
-                const repos = await makeGitHubRequest(`/orgs/${org}/repos?per_page=${perPage}&page=${page}`);
-                
-                if (!repos || repos.length === 0) {
-                  break;
-                }
-                
-                // Filter for forked repositories
-                const forkedRepos = repos.filter(repo => repo.fork).map(repo => ({
-                  name: repo.name,
-                  nameWithOwner: repo.full_name,
-                  isFork: repo.fork,
-                  defaultBranch: repo.default_branch || 'main',
-                  sourceUrl: repo.parent?.html_url || repo.source?.html_url || `https://github.com/${repo.full_name}`,
-                  description: repo.description || ''
-                }));
-                
-                allRepos = allRepos.concat(forkedRepos);
-                
-                if (repos.length < perPage) {
-                  break;
-                }
-                
-                page++;
-              }
-              
-              return allRepos;
-              
-            } catch (error) {
-              console.error('Error fetching repositories:', error.message);
-              return [];
-            }
-          }
-          
-          async function syncRepo(repoFullName, branch = 'main') {
-            try {
-              // GitHub REST API endpoint for syncing a fork
-              // POST /repos/{owner}/{repo}/merge-upstream
-              const [owner, repo] = repoFullName.split('/');
-              
-              const response = await makeGitHubRequest(`/repos/${owner}/${repo}/merge-upstream`, 'POST', {
-                branch: branch
-              });
-              
-              // Extract base_branch (e.g., "ueberdosis:develop") and convert to URL
-              // Include the current repo name to construct full upstream URL
-              const baseBranch = response.base_branch;
-              const sourceUrl = baseBranch ? `https://github.com/${baseBranch.replace(':', `/${repo}/tree/`)}` : null;
-              
-              return { success: true, message: 'Success', sourceUrl };
-            } catch (error) {
-              let message = error.message;
-              
-              // Handle specific GitHub API error messages
-              if (message.includes('409')) {
-                message = 'Already up to date';
-                return { success: true, message, sourceUrl: null }; // Treat as success
-              } else if (message.includes('422')) {
-                message = 'Cannot sync - may have conflicts or custom commits';
-              } else if (message.includes('403')) {
-                message = 'Forbidden - insufficient permissions';
-              } else if (message.includes('404')) {
-                message = 'Repository not found or not a fork';
-              }
-              
-              return { success: false, message, sourceUrl: null };
-            }
-          }
-          
-          // Utility function to add delay (in milliseconds)
-          function delay(ms) {
-            return new Promise(resolve => setTimeout(resolve, ms));
-          }
-          
-          // Main logic
+          SYNC_RESULTS_FILE: ${{ runner.temp }}/fork-sync-results.json
+        run: node .github/scripts/sync-forks.js
 
-          async function main() {
-            console.log('Fetching repositories...');
-            const forkedRepos = await getAllRepos(org);
-            
-            console.log(`Found ${forkedRepos.length} forked repositories\n`);
-            
-            if (forkedRepos.length === 0) {
-              console.log('No forked repositories found');
-              return;
-            }
-            
-            const results = [];
-            let successCount = 0;
-            let failedCount = 0;
-            
-            for (let i = 0; i < forkedRepos.length; i++) {
-              const repo = forkedRepos[i];
-              const repoName = repo.nameWithOwner;
-              const fallbackSourceUrl = repo.sourceUrl;
-              const defaultBranch = repo.defaultBranch;
-              
-              // Add delay between requests to respect rate limits (roughly 1 repo per 2 seconds)
-              // This gives us ~1800 repos per hour, well under the 5000 request limit
-              if (i > 0) {
-                await delay(2000);
-              }
-              
-              console.log(`[${i + 1}/${forkedRepos.length}] Syncing ${repoName} (${defaultBranch})...`);
-              
-              const { success, message, sourceUrl: syncSourceUrl } = await syncRepo(repoName, defaultBranch);
-              const status = success ? '✓' : '✗';
-              
-              console.log(`${status} ${repoName}${message !== 'Success' ? ` (${message})` : ''}`);
-              
-              if (success) {
-                successCount++;
-              } else {
-                failedCount++;
-              }
-              
-              // Use sourceUrl from sync response if available, otherwise use fallback
-              const finalSourceUrl = syncSourceUrl || fallbackSourceUrl;
-              
-              results.push({
-                repo: repoName,
-                status: success ? 'success' : 'failed',
-                message: message,
-                parent: finalSourceUrl,
-                branch: defaultBranch
-              });
-            }
-            
-            // Output for GitHub Actions
-            const summary = JSON.stringify(results);
-            const outputFile = process.env.GITHUB_OUTPUT;
-            
-            fs.appendFileSync(outputFile, `summary=${summary}\n`);
-            fs.appendFileSync(outputFile, `total=${forkedRepos.length}\n`);
-            fs.appendFileSync(outputFile, `success=${successCount}\n`);
-            fs.appendFileSync(outputFile, `failed=${failedCount}\n`);
-            
-            console.log(`\n✓ Successfully synced ${successCount}/${forkedRepos.length} repositories`);
-          }
-          
-          main().catch(error => {
-            console.error('Fatal error:', error);
-            process.exit(1);
-          });
-          EOF
-  
-  post-status:
-    needs: sync-forks
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Parse sync results
-        id: parse
-        run: |
-          SUMMARY='${{ needs.sync-forks.outputs.sync-summary }}'
-          echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
-      
       - name: Create or update issue
-        uses: actions/github-script@v7
+        if: ${{ always() }}
+        uses: actions/github-script@v9
         env:
-          TOTAL: ${{ needs.sync-forks.outputs.total-repos }}
-          SUCCESS: ${{ needs.sync-forks.outputs.success-count }}
-          FAILED: ${{ needs.sync-forks.outputs.failed-count }}
-          SUMMARY: ${{ steps.parse.outputs.summary }}
+          TOTAL: ${{ steps.sync.outputs.total || '0' }}
+          SUCCESS: ${{ steps.sync.outputs.success || '0' }}
+          FAILED: ${{ steps.sync.outputs.failed || '1' }}
+          SKIPPED: ${{ steps.sync.outputs.skipped || '0' }}
+          SUMMARY_FILE: ${{ runner.temp }}/fork-sync-results.json
+          SYNC_RESULT: ${{ steps.sync.outputs.failed != '0' && 'failure' || steps.sync.outcome }}
         with:
+          retries: 3
           script: |
-            const fs = require('fs');
-            const total = process.env.TOTAL;
-            const success = process.env.SUCCESS;
-            const failed = process.env.FAILED;
-            let summary = [];
-            
-            try {
-              summary = JSON.parse(process.env.SUMMARY);
-            } catch (e) {
-              console.log('Could not parse summary');
-            }
-            
-            const timestamp = new Date().toISOString();
-            const successRate = total > 0 ? ((success / total) * 100).toFixed(1) : 0;
-            
-            let statusEmoji = '✅';
-            if (failed > 0) statusEmoji = '⚠️';
-            if (failed === total) statusEmoji = '❌';
-            
-            let body = `${statusEmoji} **Fork Sync Status Report**\n\n`;
-            body += `**Timestamp:** ${timestamp}\n`;
-            body += `**Trigger:** ${process.env.GITHUB_EVENT_NAME === 'schedule' ? 'Scheduled' : 'Manual'}\n\n`;
-            
-            body += `## Summary\n`;
-            body += `| Metric | Count |\n`;
-            body += `|--------|-------|\n`;
-            body += `| Total Repos | ${total} |\n`;
-            body += `| Successful | ${success} |\n`;
-            body += `| Failed | ${failed} |\n`;
-            body += `| Success Rate | ${successRate}% |\n\n`;
-            
-            if (summary.length > 0) {
-              body += `## Detailed Results\n`;
-              
-              const successful = summary.filter(r => r.status === 'success');
-              const failed_repos = summary.filter(r => r.status === 'failed');
-              
-              if (successful.length > 0) {
-                body += `### ✅ Successful (${successful.length})\n`;
-                successful.forEach(r => {
-                  body += `- **${r.repo}** (\`${r.branch}\`) → ${r.parent}\n`;
-                });
-                body += '\n';
-              }
-              
-              if (failed_repos.length > 0) {
-                body += `### ❌ Failed (${failed_repos.length})\n`;
-                failed_repos.forEach(r => {
-                  body += `- **${r.repo}** (\`${r.branch}\`) - ${r.message}\n`;
-                });
-              }
-            }
-            
-            body += `\n---\n`;
-            body += `[View Workflow Run](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`;
-            
-            // Find existing issue
-            const issues = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'fork-sync-status'
-            });
-            
-            const existingIssue = issues.data.find(i => 
-              i.title.includes('Fork Sync Status')
-            );
-            
-            if (existingIssue) {
-              // Update existing issue with new data
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: existingIssue.number,
-                title: `Fork Sync Status - ${new Date().toISOString().split('T')[0]}`,
-                body: body
-              });
-              console.log(`Updated issue #${existingIssue.number}`);
-            } else {
-              // Create new issue
-              const issue = await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: `Fork Sync Status - ${new Date().toISOString().split('T')[0]}`,
-                body: body,
-                labels: ['fork-sync-status', 'automated']
-              });
-              console.log(`Created issue #${issue.data.number}`);
-            }
+            const postForkSyncStatus = require('./.github/scripts/post-fork-sync-status.js');
+            await postForkSyncStatus({ github, context });
+
+      - name: Fail if any repository failed
+        if: ${{ always() && (steps.sync.outcome != 'success' || steps.sync.outputs.failed != '0') }}
+        env:
+          FAILED: ${{ steps.sync.outputs.failed || 'unknown' }}
+        run: |
+          echo "::error::${FAILED} fork repository sync operation(s) failed. See the fork sync status issue for details."
+          exit 1
