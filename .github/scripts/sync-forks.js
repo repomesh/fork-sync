@@ -2,14 +2,22 @@
 
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
+const REPORT_LABEL = 'fork-sync-status';
+const STATE_PATTERN = /<!-- fork-sync-state:v1\s+([A-Za-z0-9+/=]+)\s+-->/;
 const org = process.env.ORG_NAME;
 const token = process.env.GITHUB_TOKEN;
+const statusToken = process.env.STATUS_TOKEN;
+const statusRepository = process.env.STATUS_REPOSITORY;
 const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
 const requestAttempts = Number(process.env.REQUEST_ATTEMPTS || 4);
 const requestRetryCapMs = Number(process.env.REQUEST_RETRY_CAP_MS || 60000);
 const syncDelayMs = Number(process.env.SYNC_DELAY_MS || 2000);
 const resultsFile = process.env.SYNC_RESULTS_FILE || path.join(process.env.RUNNER_TEMP || process.cwd(), 'fork-sync-results.json');
+const maxReposPerRun = parsePositiveInteger(process.env.MAX_REPOS_PER_RUN, 50);
+const minSyncAgeHours = parseNonNegativeNumber(process.env.MIN_SYNC_AGE_HOURS, 24);
+const minSyncAgeMs = minSyncAgeHours * 60 * 60 * 1000;
 
 class GitHubApiError extends Error {
   constructor(message, { status, headers, response } = {}) {
@@ -23,6 +31,16 @@ class GitHubApiError extends Error {
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parsePositiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function parseNonNegativeNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : fallback;
 }
 
 function retryAfterMs(headers) {
@@ -81,10 +99,10 @@ async function readResponse(response) {
   }
 }
 
-async function requestGitHub(path, { method = 'GET', body } = {}) {
+async function requestGitHub(path, { method = 'GET', body, authToken = token } = {}) {
   const url = `https://api.github.com${path}`;
   const headers = {
-    Authorization: `Bearer ${token}`,
+    Authorization: `Bearer ${authToken}`,
     Accept: 'application/vnd.github+json',
     'User-Agent': 'GitHub-Actions-Fork-Sync',
     'X-GitHub-Api-Version': '2022-11-28'
@@ -143,6 +161,212 @@ async function requestGitHub(path, { method = 'GET', body } = {}) {
 
 function encode(value) {
   return encodeURIComponent(value);
+}
+
+function emptySyncState() {
+  return { version: 1, repos: {} };
+}
+
+function decodeSyncState(body) {
+  const match = String(body || '').match(STATE_PATTERN);
+  if (!match) {
+    return emptySyncState();
+  }
+
+  try {
+    const json = zlib.gunzipSync(Buffer.from(match[1], 'base64')).toString('utf8');
+    const parsed = JSON.parse(json);
+    return parsed && typeof parsed.repos === 'object' ? parsed : emptySyncState();
+  } catch (error) {
+    console.log(`Could not decode previous sync state: ${error.message}`);
+    return emptySyncState();
+  }
+}
+
+async function getPreviousSyncState() {
+  if (!statusToken || !statusRepository) {
+    return emptySyncState();
+  }
+
+  const [owner, repo] = statusRepository.split('/');
+  if (!owner || !repo) {
+    return emptySyncState();
+  }
+
+  try {
+    const issues = await requestGitHub(`/repos/${encode(owner)}/${encode(repo)}/issues?state=open&labels=${encode(REPORT_LABEL)}&per_page=100`, {
+      authToken: statusToken
+    });
+    const existingIssue = Array.isArray(issues) ? issues.find(issue => issue.title?.includes('Fork Sync Status')) : null;
+    return decodeSyncState(existingIssue?.body);
+  } catch (error) {
+    console.log(`Could not load previous sync state: ${error.message}`);
+    return emptySyncState();
+  }
+}
+
+function lastSuccessfulSyncTime(syncState, repoFullName) {
+  const value = syncState.repos?.[repoFullName]?.lastSuccessfulSync;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : null;
+}
+
+function repoState(syncState, repoFullName) {
+  return syncState.repos?.[repoFullName] || {};
+}
+
+function parseTime(value) {
+  const time = Date.parse(value || '');
+  return Number.isFinite(time) ? time : null;
+}
+
+function formatAge(ms) {
+  const minutes = Math.max(1, Math.floor(ms / 60000));
+  if (minutes < 60) {
+    return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  return `${hours} hour${hours === 1 ? '' : 's'}`;
+}
+
+function recentlySyncedReason(repo, syncState, now) {
+  const lastSync = lastSuccessfulSyncTime(syncState, repo.nameWithOwner);
+  if (lastSync === null || minSyncAgeMs === 0) {
+    return null;
+  }
+
+  const age = now - lastSync;
+  if (age >= 0 && age < minSyncAgeMs) {
+    return `Skipped - successfully synced ${formatAge(age)} ago`;
+  }
+
+  return null;
+}
+
+function upstreamMetadataFromState(repo, syncState, now) {
+  const entry = repoState(syncState, repo.nameWithOwner);
+  const upstreamPushedAt = entry.upstreamPushedAt || entry.lastSuccessfulUpstreamPushedAt;
+  const upstreamCheckedAt = entry.upstreamCheckedAt;
+  const pushedTime = parseTime(upstreamPushedAt);
+  const checkedTime = parseTime(upstreamCheckedAt);
+
+  if (pushedTime === null || checkedTime === null) {
+    return null;
+  }
+
+  const refreshMs = upstreamActivityCooldownHours({ upstreamPushedAt }, now) * 60 * 60 * 1000;
+  if (now - checkedTime >= refreshMs) {
+    return null;
+  }
+
+  return {
+    ...repo,
+    upstreamName: entry.upstream || '',
+    upstreamUrl: entry.parent || repo.sourceUrl,
+    upstreamPushedAt,
+    upstreamCheckedAt,
+    upstreamMetadataSource: 'cached'
+  };
+}
+
+async function withUpstreamMetadata(repo) {
+  const [owner, repoName] = repo.nameWithOwner.split('/');
+
+  try {
+    const details = await requestGitHub(`/repos/${encode(owner)}/${encode(repoName)}`);
+    const upstream = details.parent || details.source;
+    return {
+      ...repo,
+      upstreamName: upstream?.full_name || '',
+      upstreamUrl: upstream?.html_url || repo.sourceUrl,
+      upstreamPushedAt: upstream?.pushed_at || upstream?.updated_at || null,
+      upstreamCheckedAt: new Date().toISOString(),
+      upstreamMetadataSource: 'fresh'
+    };
+  } catch (error) {
+    console.log(`Could not load upstream metadata for ${repo.nameWithOwner}: ${error.message}`);
+    return {
+      ...repo,
+      upstreamName: '',
+      upstreamUrl: repo.sourceUrl,
+      upstreamPushedAt: null,
+      upstreamCheckedAt: new Date().toISOString(),
+      upstreamMetadataSource: 'error',
+      upstreamMetadataError: error.message
+    };
+  }
+}
+
+function upstreamActivityCooldownHours(repo, now) {
+  const upstreamTime = parseTime(repo.upstreamPushedAt);
+  if (upstreamTime === null) {
+    return minSyncAgeHours;
+  }
+
+  const upstreamAgeDays = Math.max(0, (now - upstreamTime) / 86400000);
+  if (upstreamAgeDays <= 7) {
+    return 24;
+  }
+  if (upstreamAgeDays <= 30) {
+    return 72;
+  }
+  if (upstreamAgeDays <= 180) {
+    return 168;
+  }
+  if (upstreamAgeDays <= 365) {
+    return 720;
+  }
+
+  return 2160;
+}
+
+function upstreamAwareSkipReason(repo, syncState, now) {
+  const lastSync = lastSuccessfulSyncTime(syncState, repo.nameWithOwner);
+  if (lastSync === null) {
+    return null;
+  }
+
+  const upstreamTime = parseTime(repo.upstreamPushedAt);
+  if (upstreamTime !== null && upstreamTime <= lastSync) {
+    return 'Skipped - upstream has not changed since last successful sync';
+  }
+
+  const cooldownHours = Math.max(minSyncAgeHours, upstreamActivityCooldownHours(repo, now));
+  const cooldownMs = cooldownHours * 60 * 60 * 1000;
+  const age = now - lastSync;
+  if (age >= 0 && age < cooldownMs) {
+    return `Skipped - upstream activity cooldown (${cooldownHours}h) has not elapsed`;
+  }
+
+  return null;
+}
+
+function addSkippedResult(results, repo, message) {
+  results.push({
+    repo: repo.nameWithOwner,
+    status: 'skipped',
+    message,
+    parent: repo.upstreamUrl || repo.sourceUrl,
+    branch: repo.defaultBranch,
+    upstream: repo.upstreamName || '',
+    upstreamPushedAt: repo.upstreamPushedAt || null,
+    upstreamCheckedAt: repo.upstreamCheckedAt || null,
+    upstreamMetadataSource: repo.upstreamMetadataSource || ''
+  });
+}
+
+function byOldestSuccessfulSync(syncState, now) {
+  return (left, right) => {
+    const leftTime = lastSuccessfulSyncTime(syncState, left.nameWithOwner) ?? 0;
+    const rightTime = lastSuccessfulSyncTime(syncState, right.nameWithOwner) ?? 0;
+    const leftCooldown = upstreamActivityCooldownHours(left, now);
+    const rightCooldown = upstreamActivityCooldownHours(right, now);
+    const leftUpstreamTime = parseTime(left.upstreamPushedAt) ?? 0;
+    const rightUpstreamTime = parseTime(right.upstreamPushedAt) ?? 0;
+
+    return leftCooldown - rightCooldown || rightUpstreamTime - leftUpstreamTime || leftTime - rightTime || left.nameWithOwner.localeCompare(right.nameWithOwner);
+  };
 }
 
 async function listReposPage(owner, page) {
@@ -275,6 +499,8 @@ async function main() {
   }
 
   console.log(`Fetching forked repositories for ${org}...`);
+  console.log(`Batch size: ${maxReposPerRun}; skip successful syncs newer than ${minSyncAgeHours}h`);
+  const syncState = await getPreviousSyncState();
   const forkedRepos = await getAllForks(org);
   console.log(`Found ${forkedRepos.length} forked repositories`);
 
@@ -283,30 +509,54 @@ async function main() {
   let failedCount = 0;
   let skippedCount = 0;
   let attemptedSyncs = 0;
+  const eligibleRepos = [];
+  const now = Date.now();
 
   for (let index = 0; index < forkedRepos.length; index++) {
     const repo = forkedRepos[index];
-    const skipped = skipReason(repo);
+    const skipped = skipReason(repo) || recentlySyncedReason(repo, syncState, now);
 
     if (skipped) {
       skippedCount++;
       console.log(`SKIPPED ${repo.nameWithOwner} (${skipped})`);
-      results.push({
-        repo: repo.nameWithOwner,
-        status: 'skipped',
-        message: skipped,
-        parent: repo.sourceUrl,
-        branch: repo.defaultBranch
-      });
+      addSkippedResult(results, repo, skipped);
       continue;
     }
+
+    const enrichedRepo = upstreamMetadataFromState(repo, syncState, now) || await withUpstreamMetadata(repo);
+    const upstreamSkipped = upstreamAwareSkipReason(enrichedRepo, syncState, now);
+    if (upstreamSkipped) {
+      skippedCount++;
+      console.log(`SKIPPED ${enrichedRepo.nameWithOwner} (${upstreamSkipped})`);
+      addSkippedResult(results, enrichedRepo, upstreamSkipped);
+      continue;
+    }
+
+    eligibleRepos.push(enrichedRepo);
+  }
+
+  eligibleRepos.sort(byOldestSuccessfulSync(syncState, now));
+  const reposToSync = eligibleRepos.slice(0, maxReposPerRun);
+  const deferredRepos = eligibleRepos.slice(maxReposPerRun);
+
+  for (const repo of deferredRepos) {
+    const skipped = `Skipped - batch limit reached (max ${maxReposPerRun} per run)`;
+    skippedCount++;
+    console.log(`SKIPPED ${repo.nameWithOwner} (${skipped})`);
+    addSkippedResult(results, repo, skipped);
+  }
+
+  console.log(`Selected ${reposToSync.length}/${eligibleRepos.length} eligible repositories for this run`);
+
+  for (let index = 0; index < reposToSync.length; index++) {
+    const repo = reposToSync[index];
 
     if (attemptedSyncs > 0 && syncDelayMs > 0) {
       await delay(syncDelayMs);
     }
     attemptedSyncs++;
 
-    console.log(`[${index + 1}/${forkedRepos.length}] Syncing ${repo.nameWithOwner} (${repo.defaultBranch})...`);
+    console.log(`[${index + 1}/${reposToSync.length}] Syncing ${repo.nameWithOwner} (${repo.defaultBranch})...`);
 
     const result = await syncRepo(repo.nameWithOwner, repo.defaultBranch);
     const status = result.success ? 'success' : 'failed';
@@ -322,8 +572,12 @@ async function main() {
       repo: repo.nameWithOwner,
       status,
       message: result.message,
-      parent: result.sourceUrl || repo.sourceUrl,
-      branch: repo.defaultBranch
+        parent: result.sourceUrl || repo.upstreamUrl || repo.sourceUrl,
+        branch: repo.defaultBranch,
+        upstream: repo.upstreamName || '',
+        upstreamPushedAt: repo.upstreamPushedAt || null,
+        upstreamCheckedAt: repo.upstreamCheckedAt || null,
+        upstreamMetadataSource: repo.upstreamMetadataSource || ''
     });
   }
 

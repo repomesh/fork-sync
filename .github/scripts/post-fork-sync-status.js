@@ -1,11 +1,13 @@
 'use strict';
 
 const fs = require('fs');
+const zlib = require('zlib');
 
 const REPORT_LABEL = 'fork-sync-status';
 const AUTOMATED_LABEL = 'automated';
 const MAX_REPOS_PER_SECTION = 200;
 const MAX_BODY_LENGTH = 60000;
+const STATE_PATTERN = /<!-- fork-sync-state:v1\s+([A-Za-z0-9+/=]+)\s+-->/;
 
 function parseCount(value) {
   const count = Number(value || 0);
@@ -24,6 +26,61 @@ function parseSummary(value) {
     console.log(`Could not parse sync summary: ${error.message}`);
     return [];
   }
+}
+
+function emptySyncState() {
+  return { version: 1, repos: {} };
+}
+
+function decodeSyncState(body) {
+  const match = String(body || '').match(STATE_PATTERN);
+  if (!match) {
+    return emptySyncState();
+  }
+
+  try {
+    const json = zlib.gunzipSync(Buffer.from(match[1], 'base64')).toString('utf8');
+    const parsed = JSON.parse(json);
+    return parsed && typeof parsed.repos === 'object' ? parsed : emptySyncState();
+  } catch (error) {
+    console.log(`Could not decode previous sync state: ${error.message}`);
+    return emptySyncState();
+  }
+}
+
+function encodeSyncState(state) {
+  const encoded = zlib.gzipSync(JSON.stringify(state)).toString('base64');
+  return `<!-- fork-sync-state:v1\n${encoded}\n-->`;
+}
+
+function mergeSyncState(previousState, summary) {
+  const now = new Date().toISOString();
+  const repos = {};
+
+  for (const result of summary) {
+    if (!result.repo) {
+      continue;
+    }
+
+    const entry = { ...(previousState.repos?.[result.repo] || {}) };
+    entry.lastSeen = now;
+    entry.lastStatus = result.status;
+    entry.lastMessage = oneLine(result.message, 1000);
+    entry.branch = result.branch || '';
+    entry.parent = result.parent || '';
+    entry.upstream = result.upstream || entry.upstream || '';
+    entry.upstreamPushedAt = result.upstreamPushedAt || entry.upstreamPushedAt || null;
+    entry.upstreamCheckedAt = result.upstreamCheckedAt || entry.upstreamCheckedAt || null;
+
+    if (result.status === 'success') {
+      entry.lastSuccessfulSync = now;
+      entry.lastSuccessfulUpstreamPushedAt = result.upstreamPushedAt || entry.lastSuccessfulUpstreamPushedAt || null;
+    }
+
+    repos[result.repo] = entry;
+  }
+
+  return { version: 1, updatedAt: now, repos };
 }
 
 function loadSummary() {
@@ -78,12 +135,12 @@ function appendResults(body, title, results, includeParent) {
   return `${body}\n`;
 }
 
-function trimBody(body) {
-  if (body.length <= MAX_BODY_LENGTH) {
+function trimBody(body, maxLength = MAX_BODY_LENGTH) {
+  if (body.length <= maxLength) {
     return body;
   }
 
-  return `${body.slice(0, MAX_BODY_LENGTH)}\n\n_Result details truncated because the issue body reached the GitHub limit._\n`;
+  return `${body.slice(0, maxLength)}\n\n_Result details truncated because the issue body reached the GitHub limit._\n`;
 }
 
 async function ensureLabel(github, repoContext, label) {
@@ -134,6 +191,8 @@ module.exports = async function postForkSyncStatus({ github, context }) {
   body += `**Timestamp:** ${new Date().toISOString()}\n`;
   body += `**Trigger:** ${process.env.GITHUB_EVENT_NAME === 'schedule' ? 'Scheduled' : 'Manual'}\n`;
   body += `**Workflow result:** ${syncResult}\n\n`;
+  body += `**Batch size:** ${process.env.MAX_REPOS_PER_RUN || '50'}\n`;
+  body += `**Recent sync window:** ${process.env.MIN_SYNC_AGE_HOURS || '24'}h\n\n`;
   body += `## Summary\n`;
   body += `| Metric | Count |\n`;
   body += `|--------|-------|\n`;
@@ -157,7 +216,6 @@ module.exports = async function postForkSyncStatus({ github, context }) {
 
   body += `---\n`;
   body += `[View Workflow Run](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})\n`;
-  body = trimBody(body);
 
   await ensureLabel(github, repoContext, {
     name: REPORT_LABEL,
@@ -179,6 +237,11 @@ module.exports = async function postForkSyncStatus({ github, context }) {
 
   const existingIssue = issues.data.find(issue => issue.title.includes('Fork Sync Status'));
   const title = `Fork Sync Status - ${new Date().toISOString().slice(0, 10)}`;
+  const previousState = decodeSyncState(existingIssue?.body);
+  const nextState = mergeSyncState(previousState, summary);
+  const stateComment = encodeSyncState(nextState);
+  const visibleBodyBudget = Math.max(1000, MAX_BODY_LENGTH - stateComment.length - 1);
+  body = `${trimBody(body, visibleBodyBudget)}\n${stateComment}`;
 
   if (existingIssue) {
     await github.rest.issues.update({

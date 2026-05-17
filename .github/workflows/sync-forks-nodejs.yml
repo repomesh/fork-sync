@@ -2,8 +2,17 @@ name: Sync All Forked Repos (Node.js)
 
 "on":
   schedule:
-    - cron: '0 2 * * 0'
+    - cron: '17 */2 * * *'
   workflow_dispatch:
+    inputs:
+      max_repos:
+        description: 'Maximum repositories to sync in one run'
+        required: false
+        default: '50'
+      min_sync_age_hours:
+        description: 'Skip repositories successfully synced within this many hours'
+        required: false
+        default: '24'
 
 concurrency:
   group: sync-forks-${{ github.repository }}
@@ -29,8 +38,12 @@ jobs:
         id: sync
         env:
           GITHUB_TOKEN: ${{ secrets.FORK_SYNC_PAT }}
+          STATUS_TOKEN: ${{ github.token }}
+          STATUS_REPOSITORY: ${{ github.repository }}
           ORG_NAME: ${{ github.repository_owner }}
           SYNC_RESULTS_FILE: ${{ runner.temp }}/fork-sync-results.json
+          MAX_REPOS_PER_RUN: ${{ github.event.inputs.max_repos || '50' }}
+          MIN_SYNC_AGE_HOURS: ${{ github.event.inputs.min_sync_age_hours || '24' }}
         run: node .github/scripts/sync-forks.js
 
       - name: Create or update issue
@@ -43,6 +56,8 @@ jobs:
           SKIPPED: ${{ steps.sync.outputs.skipped || '0' }}
           SUMMARY_FILE: ${{ runner.temp }}/fork-sync-results.json
           SYNC_RESULT: ${{ steps.sync.outputs.failed != '0' && 'failure' || steps.sync.outcome }}
+          MAX_REPOS_PER_RUN: ${{ github.event.inputs.max_repos || '50' }}
+          MIN_SYNC_AGE_HOURS: ${{ github.event.inputs.min_sync_age_hours || '24' }}
         with:
           retries: 3
           script: |
