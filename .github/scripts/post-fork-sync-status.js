@@ -69,12 +69,20 @@ function mergeSyncState(previousState, summary) {
     entry.branch = result.branch || '';
     entry.parent = result.parent || '';
     entry.upstream = result.upstream || entry.upstream || '';
+    entry.upstreamDefaultBranch = result.upstreamDefaultBranch || entry.upstreamDefaultBranch || result.branch || '';
     entry.upstreamPushedAt = result.upstreamPushedAt || entry.upstreamPushedAt || null;
     entry.upstreamCheckedAt = result.upstreamCheckedAt || entry.upstreamCheckedAt || null;
 
     if (result.status === 'success') {
       entry.lastSuccessfulSync = now;
       entry.lastSuccessfulUpstreamPushedAt = result.upstreamPushedAt || entry.lastSuccessfulUpstreamPushedAt || null;
+      delete entry.lastBlockedSync;
+      delete entry.lastBlockedUpstreamPushedAt;
+    }
+
+    if (result.status === 'blocked') {
+      entry.lastBlockedSync = now;
+      entry.lastBlockedUpstreamPushedAt = result.upstreamPushedAt || entry.lastBlockedUpstreamPushedAt || null;
     }
 
     repos[result.repo] = entry;
@@ -172,6 +180,7 @@ module.exports = async function postForkSyncStatus({ github, context }) {
   const total = parseCount(process.env.TOTAL);
   const success = parseCount(process.env.SUCCESS);
   const failed = parseCount(process.env.FAILED);
+  const blocked = parseCount(process.env.BLOCKED);
   const skipped = parseCount(process.env.SKIPPED);
   const syncResult = process.env.SYNC_RESULT || 'unknown';
   const summary = loadSummary();
@@ -180,7 +189,7 @@ module.exports = async function postForkSyncStatus({ github, context }) {
   const successRate = attempted > 0 ? ((success / attempted) * 100).toFixed(1) : '0.0';
 
   let statusIcon = ':white_check_mark:';
-  if (effectiveFailed > 0) {
+  if (effectiveFailed > 0 || blocked > 0) {
     statusIcon = ':warning:';
   }
   if (total > 0 && effectiveFailed >= total) {
@@ -192,7 +201,10 @@ module.exports = async function postForkSyncStatus({ github, context }) {
   body += `**Trigger:** ${process.env.GITHUB_EVENT_NAME === 'schedule' ? 'Scheduled' : 'Manual'}\n`;
   body += `**Workflow result:** ${syncResult}\n\n`;
   body += `**Batch size:** ${process.env.MAX_REPOS_PER_RUN || '50'}\n`;
+  body += `**Sync delay:** ${process.env.SYNC_DELAY_MS || '5000'}ms\n`;
   body += `**Recent sync window:** ${process.env.MIN_SYNC_AGE_HOURS || '24'}h\n\n`;
+  body += `**Blocked retry window:** ${process.env.BLOCKED_RETRY_HOURS || '168'}h\n\n`;
+  body += `**Force blocked sync:** ${process.env.FORCE_BLOCKED_SYNC || 'true'}\n\n`;
   body += `## Summary\n`;
   body += `| Metric | Count |\n`;
   body += `|--------|-------|\n`;
@@ -200,16 +212,19 @@ module.exports = async function postForkSyncStatus({ github, context }) {
   body += `| Attempted | ${attempted} |\n`;
   body += `| Successful | ${success} |\n`;
   body += `| Failed | ${failed} |\n`;
+  body += `| Blocked | ${blocked} |\n`;
   body += `| Skipped | ${skipped} |\n`;
   body += `| Success Rate | ${successRate}% |\n\n`;
 
   if (summary.length > 0) {
     const successful = summary.filter(result => result.status === 'success');
     const failedRepos = summary.filter(result => result.status === 'failed');
+    const blockedRepos = summary.filter(result => result.status === 'blocked');
     const skippedRepos = summary.filter(result => result.status === 'skipped');
 
     body += `## Detailed Results\n`;
     body = appendResults(body, 'Successful', successful, true);
+    body = appendResults(body, 'Blocked', blockedRepos, false);
     body = appendResults(body, 'Failed', failedRepos, false);
     body = appendResults(body, 'Skipped', skippedRepos, false);
   }

@@ -9,10 +9,22 @@ name: Sync All Forked Repos (Node.js)
         description: 'Maximum repositories to sync in one run'
         required: false
         default: '50'
+      sync_delay_ms:
+        description: 'Milliseconds to wait between repository sync attempts'
+        required: false
+        default: '5000'
       min_sync_age_hours:
         description: 'Skip repositories successfully synced within this many hours'
         required: false
         default: '24'
+      blocked_retry_hours:
+        description: 'Retry repositories blocked by conflicts/custom commits after this many hours'
+        required: false
+        default: '168'
+      force_blocked_sync:
+        description: 'Reset fork branches to upstream when automatic sync is blocked'
+        required: false
+        default: 'true'
 
 concurrency:
   group: sync-forks-${{ github.repository }}
@@ -43,7 +55,10 @@ jobs:
           ORG_NAME: ${{ github.repository_owner }}
           SYNC_RESULTS_FILE: ${{ runner.temp }}/fork-sync-results.json
           MAX_REPOS_PER_RUN: ${{ github.event.inputs.max_repos || '50' }}
+          SYNC_DELAY_MS: ${{ github.event.inputs.sync_delay_ms || '5000' }}
           MIN_SYNC_AGE_HOURS: ${{ github.event.inputs.min_sync_age_hours || '24' }}
+          BLOCKED_RETRY_HOURS: ${{ github.event.inputs.blocked_retry_hours || '168' }}
+          FORCE_BLOCKED_SYNC: ${{ github.event.inputs.force_blocked_sync || 'true' }}
         run: node .github/scripts/sync-forks.js
 
       - name: Create or update issue
@@ -53,11 +68,15 @@ jobs:
           TOTAL: ${{ steps.sync.outputs.total || '0' }}
           SUCCESS: ${{ steps.sync.outputs.success || '0' }}
           FAILED: ${{ steps.sync.outputs.failed || '1' }}
+          BLOCKED: ${{ steps.sync.outputs.blocked || '0' }}
           SKIPPED: ${{ steps.sync.outputs.skipped || '0' }}
           SUMMARY_FILE: ${{ runner.temp }}/fork-sync-results.json
           SYNC_RESULT: ${{ steps.sync.outputs.failed != '0' && 'failure' || steps.sync.outcome }}
           MAX_REPOS_PER_RUN: ${{ github.event.inputs.max_repos || '50' }}
+          SYNC_DELAY_MS: ${{ github.event.inputs.sync_delay_ms || '5000' }}
           MIN_SYNC_AGE_HOURS: ${{ github.event.inputs.min_sync_age_hours || '24' }}
+          BLOCKED_RETRY_HOURS: ${{ github.event.inputs.blocked_retry_hours || '168' }}
+          FORCE_BLOCKED_SYNC: ${{ github.event.inputs.force_blocked_sync || 'true' }}
         with:
           retries: 3
           script: |

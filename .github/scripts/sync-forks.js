@@ -13,11 +13,14 @@ const statusRepository = process.env.STATUS_REPOSITORY;
 const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
 const requestAttempts = Number(process.env.REQUEST_ATTEMPTS || 4);
 const requestRetryCapMs = Number(process.env.REQUEST_RETRY_CAP_MS || 60000);
-const syncDelayMs = Number(process.env.SYNC_DELAY_MS || 2000);
+const syncDelayMs = Number(process.env.SYNC_DELAY_MS || 5000);
 const resultsFile = process.env.SYNC_RESULTS_FILE || path.join(process.env.RUNNER_TEMP || process.cwd(), 'fork-sync-results.json');
 const maxReposPerRun = parsePositiveInteger(process.env.MAX_REPOS_PER_RUN, 50);
 const minSyncAgeHours = parseNonNegativeNumber(process.env.MIN_SYNC_AGE_HOURS, 24);
 const minSyncAgeMs = minSyncAgeHours * 60 * 60 * 1000;
+const blockedRetryHours = parseNonNegativeNumber(process.env.BLOCKED_RETRY_HOURS, 168);
+const blockedRetryMs = blockedRetryHours * 60 * 60 * 1000;
+const forceBlockedSync = parseBoolean(process.env.FORCE_BLOCKED_SYNC, true);
 
 class GitHubApiError extends Error {
   constructor(message, { status, headers, response } = {}) {
@@ -41,6 +44,14 @@ function parsePositiveInteger(value, fallback) {
 function parseNonNegativeNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+
+function parseBoolean(value, fallback) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
 }
 
 function retryAfterMs(headers) {
@@ -263,6 +274,7 @@ function upstreamMetadataFromState(repo, syncState, now) {
   return {
     ...repo,
     upstreamName: entry.upstream || '',
+    upstreamDefaultBranch: entry.upstreamDefaultBranch || repo.defaultBranch,
     upstreamUrl: entry.parent || repo.sourceUrl,
     upstreamPushedAt,
     upstreamCheckedAt,
@@ -279,6 +291,7 @@ async function withUpstreamMetadata(repo) {
     return {
       ...repo,
       upstreamName: upstream?.full_name || '',
+      upstreamDefaultBranch: upstream?.default_branch || repo.defaultBranch,
       upstreamUrl: upstream?.html_url || repo.sourceUrl,
       upstreamPushedAt: upstream?.pushed_at || upstream?.updated_at || null,
       upstreamCheckedAt: new Date().toISOString(),
@@ -289,6 +302,7 @@ async function withUpstreamMetadata(repo) {
     return {
       ...repo,
       upstreamName: '',
+      upstreamDefaultBranch: repo.defaultBranch,
       upstreamUrl: repo.sourceUrl,
       upstreamPushedAt: null,
       upstreamCheckedAt: new Date().toISOString(),
@@ -342,6 +356,31 @@ function upstreamAwareSkipReason(repo, syncState, now) {
   return null;
 }
 
+function blockedSyncRetryReason(repo, syncState, now) {
+  const entry = repoState(syncState, repo.nameWithOwner);
+  if (forceBlockedSync && !String(entry.lastMessage || '').includes('forced upstream reset failed')) {
+    return null;
+  }
+
+  const lastBlocked = parseTime(entry.lastBlockedSync);
+  if (lastBlocked === null || blockedRetryMs === 0) {
+    return null;
+  }
+
+  const upstreamTime = parseTime(repo.upstreamPushedAt);
+  const blockedUpstreamTime = parseTime(entry.lastBlockedUpstreamPushedAt);
+  if (upstreamTime !== null && blockedUpstreamTime !== null && upstreamTime > blockedUpstreamTime) {
+    return null;
+  }
+
+  const age = now - lastBlocked;
+  if (age >= 0 && age < blockedRetryMs) {
+    return `Skipped - previous automatic sync was blocked ${formatAge(age)} ago; retry after ${blockedRetryHours}h or upstream change`;
+  }
+
+  return null;
+}
+
 function addSkippedResult(results, repo, message) {
   results.push({
     repo: repo.nameWithOwner,
@@ -350,6 +389,7 @@ function addSkippedResult(results, repo, message) {
     parent: repo.upstreamUrl || repo.sourceUrl,
     branch: repo.defaultBranch,
     upstream: repo.upstreamName || '',
+    upstreamDefaultBranch: repo.upstreamDefaultBranch || repo.defaultBranch,
     upstreamPushedAt: repo.upstreamPushedAt || null,
     upstreamCheckedAt: repo.upstreamCheckedAt || null,
     upstreamMetadataSource: repo.upstreamMetadataSource || ''
@@ -387,6 +427,44 @@ function repoSourceUrl(repo) {
   return repo.parent?.html_url || repo.source?.html_url || repo.html_url || `https://github.com/${repo.full_name}`;
 }
 
+function apiErrorMessage(error, fallback) {
+  if (error instanceof GitHubApiError && error.response && typeof error.response === 'object') {
+    return error.response.message || fallback;
+  }
+
+  return fallback;
+}
+
+function splitRepoFullName(fullName) {
+  const [owner, repo] = String(fullName || '').split('/');
+  return owner && repo ? { owner, repo } : null;
+}
+
+async function resetForkBranchToUpstream(repoFullName, branch, upstreamName, upstreamBranch) {
+  const fork = splitRepoFullName(repoFullName);
+  const upstream = splitRepoFullName(upstreamName);
+  if (!fork || !upstream || !upstreamBranch) {
+    return null;
+  }
+
+  const upstreamBranchDetails = await requestGitHub(`/repos/${encode(upstream.owner)}/${encode(upstream.repo)}/branches/${encode(upstreamBranch)}`);
+  const targetSha = upstreamBranchDetails?.commit?.sha;
+  if (!targetSha) {
+    return null;
+  }
+
+  await requestGitHub(`/repos/${encode(fork.owner)}/${encode(fork.repo)}/git/refs/heads/${encode(branch)}`, {
+    method: 'PATCH',
+    body: { sha: targetSha, force: true }
+  });
+
+  return {
+    status: 'success',
+    message: `Reset ${branch} to upstream ${upstreamName}:${upstreamBranch} after merge-upstream could not auto-sync`,
+    sourceUrl: null
+  };
+}
+
 async function getAllForks(owner) {
   const allRepos = [];
 
@@ -419,7 +497,7 @@ async function getAllForks(owner) {
   return allRepos;
 }
 
-async function syncRepo(repoFullName, branch = 'main') {
+async function syncRepo(repoFullName, branch = 'main', upstreamName = '', upstreamBranch = branch) {
   const [owner, repo] = repoFullName.split('/');
 
   try {
@@ -429,18 +507,47 @@ async function syncRepo(repoFullName, branch = 'main') {
     });
 
     return {
-      success: true,
+      status: 'success',
       message: response?.message || 'Success',
       sourceUrl: null
     };
   } catch (error) {
     let message = error.message;
+    let status = 'failed';
 
     if (error instanceof GitHubApiError) {
       if (error.status === 409) {
-        message = 'Cannot sync - merge conflict with upstream';
+        if (forceBlockedSync) {
+          try {
+            const reset = await resetForkBranchToUpstream(repoFullName, branch, upstreamName, upstreamBranch);
+            if (reset) {
+              return reset;
+            }
+          } catch (fallbackError) {
+            status = 'blocked';
+            message = `Blocked - ${apiErrorMessage(error, 'merge conflict with upstream')}; forced upstream reset failed: ${fallbackError.message}`;
+            return { status, message, sourceUrl: null };
+          }
+        }
+
+        status = 'blocked';
+        message = `Blocked - ${apiErrorMessage(error, 'merge conflict with upstream')}`;
       } else if (error.status === 422) {
-        message = 'Cannot sync - may have conflicts or custom commits';
+        if (forceBlockedSync) {
+          try {
+            const reset = await resetForkBranchToUpstream(repoFullName, branch, upstreamName, upstreamBranch);
+            if (reset) {
+              return reset;
+            }
+          } catch (fallbackError) {
+            status = 'blocked';
+            message = `Blocked - ${apiErrorMessage(error, 'GitHub could not sync this branch for another reason')}; forced upstream reset failed: ${fallbackError.message}`;
+            return { status, message, sourceUrl: null };
+          }
+        }
+
+        status = 'blocked';
+        message = `Blocked - ${apiErrorMessage(error, 'GitHub could not sync this branch for another reason')}`;
       } else if (error.status === 403) {
         message = 'Forbidden - insufficient permissions or rate limited';
       } else if (error.status === 404) {
@@ -448,7 +555,7 @@ async function syncRepo(repoFullName, branch = 'main') {
       }
     }
 
-    return { success: false, message, sourceUrl: null };
+    return { status, message, sourceUrl: null };
   }
 }
 
@@ -480,12 +587,13 @@ function writeResultsFile(results) {
   fs.writeFileSync(resultsFile, `${JSON.stringify(results, null, 2)}\n`);
 }
 
-function writeOutputs({ results, total, successCount, failedCount, skippedCount }) {
+function writeOutputs({ results, total, successCount, failedCount, blockedCount, skippedCount }) {
   writeResultsFile(results);
   setOutput('summary-file', resultsFile);
   setOutput('total', total);
   setOutput('success', successCount);
   setOutput('failed', failedCount);
+  setOutput('blocked', blockedCount);
   setOutput('skipped', skippedCount);
 }
 
@@ -507,6 +615,7 @@ async function main() {
   const results = [];
   let successCount = 0;
   let failedCount = 0;
+  let blockedCount = 0;
   let skippedCount = 0;
   let attemptedSyncs = 0;
   const eligibleRepos = [];
@@ -529,6 +638,14 @@ async function main() {
       skippedCount++;
       console.log(`SKIPPED ${enrichedRepo.nameWithOwner} (${upstreamSkipped})`);
       addSkippedResult(results, enrichedRepo, upstreamSkipped);
+      continue;
+    }
+
+    const blockedSkipped = blockedSyncRetryReason(enrichedRepo, syncState, now);
+    if (blockedSkipped) {
+      skippedCount++;
+      console.log(`SKIPPED ${enrichedRepo.nameWithOwner} (${blockedSkipped})`);
+      addSkippedResult(results, enrichedRepo, blockedSkipped);
       continue;
     }
 
@@ -558,12 +675,14 @@ async function main() {
 
     console.log(`[${index + 1}/${reposToSync.length}] Syncing ${repo.nameWithOwner} (${repo.defaultBranch})...`);
 
-    const result = await syncRepo(repo.nameWithOwner, repo.defaultBranch);
-    const status = result.success ? 'success' : 'failed';
+    const result = await syncRepo(repo.nameWithOwner, repo.defaultBranch, repo.upstreamName, repo.upstreamDefaultBranch || repo.defaultBranch);
+    const status = result.status;
     console.log(`${status.toUpperCase()} ${repo.nameWithOwner}${result.message !== 'Success' ? ` (${result.message})` : ''}`);
 
-    if (result.success) {
+    if (status === 'success') {
       successCount++;
+    } else if (status === 'blocked') {
+      blockedCount++;
     } else {
       failedCount++;
     }
@@ -572,17 +691,18 @@ async function main() {
       repo: repo.nameWithOwner,
       status,
       message: result.message,
-        parent: result.sourceUrl || repo.upstreamUrl || repo.sourceUrl,
-        branch: repo.defaultBranch,
-        upstream: repo.upstreamName || '',
-        upstreamPushedAt: repo.upstreamPushedAt || null,
-        upstreamCheckedAt: repo.upstreamCheckedAt || null,
-        upstreamMetadataSource: repo.upstreamMetadataSource || ''
+      parent: result.sourceUrl || repo.upstreamUrl || repo.sourceUrl,
+      branch: repo.defaultBranch,
+      upstream: repo.upstreamName || '',
+      upstreamDefaultBranch: repo.upstreamDefaultBranch || repo.defaultBranch,
+      upstreamPushedAt: repo.upstreamPushedAt || null,
+      upstreamCheckedAt: repo.upstreamCheckedAt || null,
+      upstreamMetadataSource: repo.upstreamMetadataSource || ''
     });
   }
 
-  writeOutputs({ results, total: forkedRepos.length, successCount, failedCount, skippedCount });
-  console.log(`Successfully synced ${successCount}/${attemptedSyncs} attempted repositories; failed ${failedCount}; skipped ${skippedCount}`);
+  writeOutputs({ results, total: forkedRepos.length, successCount, failedCount, blockedCount, skippedCount });
+  console.log(`Successfully synced ${successCount}/${attemptedSyncs} attempted repositories; blocked ${blockedCount}; failed ${failedCount}; skipped ${skippedCount}`);
 }
 
 main().catch(error => {
@@ -601,6 +721,7 @@ main().catch(error => {
     total: 0,
     successCount: 0,
     failedCount: 1,
+    blockedCount: 0,
     skippedCount: 0
   });
 });
